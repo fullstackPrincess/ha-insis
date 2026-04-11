@@ -1,0 +1,12 @@
+{
+  "domain": "insis_intercom",
+  "name": "Insis Intercom",
+  "codeowners": ["@fullstackPrincess"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/fullstackPrincess/ha-insis",
+  "issue_tracker": "https://github.com/fullstackPrincess/ha-insis/issues",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "1.0.0"
+}

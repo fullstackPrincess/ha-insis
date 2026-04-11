@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Insis Intercom",
+        "description": "Enter the phone number linked to your intercom",
+        "data": {
+          "phone": "Phone number"
+        }
+      },
+      "code": {
+        "title": "SMS Code",
+        "description": "Enter the code sent to {phone}",
+        "data": {
+          "code": "Code"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "sms_failed": "Failed to send SMS",
+      "invalid_code": "Invalid code"
+    }
+  }
+}
