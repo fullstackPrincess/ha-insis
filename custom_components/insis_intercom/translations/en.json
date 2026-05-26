@@ -9,17 +9,24 @@
         }
       },
       "code": {
-        "title": "SMS Code",
+        "title": "SMS code",
         "description": "Enter the code sent to {phone}",
         "data": {
           "code": "Code"
         }
+      },
+      "reauth_confirm": {
+        "title": "Re-authentication required",
+        "description": "Refresh token expired. Press Submit to receive a new SMS at {phone}"
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect",
-      "sms_failed": "Failed to send SMS",
+      "cannot_connect": "Cannot connect",
+      "sms_failed": "SMS sending failed",
       "invalid_code": "Invalid code"
+    },
+    "abort": {
+      "reauth_successful": "Re-authentication successful"
     }
   }
 }

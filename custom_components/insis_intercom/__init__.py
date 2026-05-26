@@ -2,6 +2,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .const import DOMAIN, PLATFORMS, CONF_REFRESH_TOKEN
 from .api import InsisApi
@@ -11,9 +12,14 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    api = InsisApi(entry.data[CONF_REFRESH_TOKEN])
+    api = InsisApi(entry.data[CONF_REFRESH_TOKEN], hass=hass, entry=entry)
 
-    if not await api.validate():
+    try:
+        ok = await api.validate()
+    except ConfigEntryAuthFailed:
+        await api.close()
+        raise
+    if not ok:
         _LOGGER.error("Insis API validation failed")
         await api.close()
         return False

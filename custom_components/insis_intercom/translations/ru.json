@@ -14,12 +14,19 @@
         "data": {
           "code": "Код"
         }
+      },
+      "reauth_confirm": {
+        "title": "Повторная авторизация",
+        "description": "Refresh-token истёк. Нажмите Submit — отправим SMS на {phone}"
       }
     },
     "error": {
       "cannot_connect": "Не удалось подключиться",
       "sms_failed": "Не удалось отправить SMS",
       "invalid_code": "Неверный код"
+    },
+    "abort": {
+      "reauth_successful": "Авторизация обновлена"
     }
   }
 }
