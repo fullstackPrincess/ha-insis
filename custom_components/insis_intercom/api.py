@@ -1,6 +1,9 @@
+import base64
+import json
 import logging
-import aiohttp
 import time
+
+import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -34,15 +37,51 @@ class InsisApi:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    # Rotate stored refresh_token only when current one is within this window of expiry.
+    _PERSIST_WHEN_EXPIRES_WITHIN_SECONDS = 24 * 3600
+
+    @staticmethod
+    def _jwt_exp(token: str) -> int | None:
+        """Decode JWT exp claim (seconds since epoch). None on failure."""
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            return int(data.get("exp", 0))
+        except Exception:
+            return None
+
+    def _refresh_token_due_for_rotation(self) -> bool:
+        """True when current refresh_token expires within the persist window."""
+        exp = self._jwt_exp(self._refresh_token)
+        if exp is None:
+            return True  # opaque token — be conservative, allow rotation
+        remaining = exp - time.time()
+        return remaining < self._PERSIST_WHEN_EXPIRES_WITHIN_SECONDS
+
     def _persist_refresh_token(self, new_token: str) -> None:
-        """Save rotated refreshToken back into the config entry."""
-        if new_token == self._refresh_token:
+        """Save rotated refreshToken back into the config entry — only when needed.
+
+        Server may rotate refresh_token on every /refresh call. We don'"'"'t persist
+        every rotation (that would mean a disk write every ~14 min). Instead we
+        rotate the stored value only when the current one is close to its hard
+        expiry (45 days from issuance). The on-disk token stays valid for ages,
+        and we read it fresh on HA restart.
+        """
+        if not new_token or new_token == self._refresh_token:
+            return
+        if not self._refresh_token_due_for_rotation():
+            _LOGGER.debug(
+                "Insis: server rotated refresh_token but current is still fresh "
+                "(>%dh to exp) — keeping persisted value",
+                self._PERSIST_WHEN_EXPIRES_WITHIN_SECONDS // 3600,
+            )
             return
         self._refresh_token = new_token
         if self._hass and self._entry:
             new_data = {**self._entry.data, CONF_REFRESH_TOKEN: new_token}
             self._hass.config_entries.async_update_entry(self._entry, data=new_data)
-            _LOGGER.debug("Insis refresh_token rotated and persisted")
+            _LOGGER.info("Insis refresh_token rotated and persisted (was within 24h of expiry)")
 
     async def _ensure_token(self) -> str:
         if self._access_token and time.time() < self._token_expires - 30:
