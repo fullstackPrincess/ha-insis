@@ -221,11 +221,12 @@ class InsisApi:
             return await resp.json()
 
     async def validate(self) -> bool:
-        try:
-            apartments = await self.get_apartments()
-            return isinstance(apartments, list)
-        except ConfigEntryAuthFailed:
-            raise
-        except Exception as err:
-            _LOGGER.warning("Insis validate failed: %s", err)
-            return False
+        """Check the stored refresh_token against the cloud.
+
+        Returns False only when the API answers with something unexpected.
+        Auth failures raise ConfigEntryAuthFailed, and transient failures
+        (network, DNS, 5xx) propagate as-is so the caller can retry — swallowing
+        them into False made setup fail permanently.
+        """
+        apartments = await self.get_apartments()
+        return isinstance(apartments, list)
