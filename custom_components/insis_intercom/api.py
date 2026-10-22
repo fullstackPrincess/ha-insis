@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -13,6 +14,10 @@ from .const import SSO_BASE_URL, API_BASE_URL, APPLICATION_ID, CONF_REFRESH_TOKE
 
 _LOGGER = logging.getLogger(__name__)
 
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+# Used only when the access token is not a JWT with an exp claim.
+ACCESS_TOKEN_FALLBACK_TTL = 850
+
 
 class InsisApi:
     def __init__(
@@ -27,18 +32,22 @@ class InsisApi:
         self._access_token: str | None = None
         self._token_expires: float = 0
         self._session: aiohttp.ClientSession | None = None
+        # One refresh at a time: two parallel refreshes would spend the same
+        # refresh_token twice, and the SSO revokes the session for that.
+        self._refresh_lock = asyncio.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            # No cookie jar: the refresh_token cookie is sent explicitly, so a
+            # stale one kept by aiohttp can never go out instead.
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar(), timeout=REQUEST_TIMEOUT
+            )
         return self._session
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
-
-    # Rotate stored refresh_token only when current one is within this window of expiry.
-    _PERSIST_WHEN_EXPIRES_WITHIN_SECONDS = 24 * 3600
 
     @staticmethod
     def _jwt_exp(token: str) -> int | None:
@@ -47,94 +56,103 @@ class InsisApi:
             payload = token.split(".")[1]
             payload += "=" * (-len(payload) % 4)
             data = json.loads(base64.urlsafe_b64decode(payload))
-            return int(data.get("exp", 0))
+            return int(data["exp"])
         except Exception:
             return None
 
-    def _refresh_token_due_for_rotation(self) -> bool:
-        """True when current refresh_token expires within the persist window."""
-        exp = self._jwt_exp(self._refresh_token)
-        if exp is None:
-            return True  # opaque token — be conservative, allow rotation
-        remaining = exp - time.time()
-        return remaining < self._PERSIST_WHEN_EXPIRES_WITHIN_SECONDS
-
     def _persist_refresh_token(self, new_token: str) -> None:
-        """Save rotated refreshToken back into the config entry — only when needed.
+        """Use the rotated refresh_token from now on and save it at once.
 
-        Server may rotate refresh_token on every /refresh call. We don'"'"'t persist
-        every rotation (that would mean a disk write every ~14 min). Instead we
-        rotate the stored value only when the current one is close to its hard
-        expiry (45 days from issuance). The on-disk token stays valid for ages,
-        and we read it fresh on HA restart.
+        Since the Super App release (October 2026) the SSO rotates the
+        refresh_token on every /refresh and revokes the session when an old
+        one is used again (after a grace of about half a minute). The stored
+        value must therefore always be the latest one, or the next refresh,
+        or the first one after an HA restart, logs the integration out.
         """
-        if not new_token or new_token == self._refresh_token:
-            return
-        if not self._refresh_token_due_for_rotation():
-            _LOGGER.debug(
-                "Insis: server rotated refresh_token but current is still fresh "
-                "(>%dh to exp) — keeping persisted value",
-                self._PERSIST_WHEN_EXPIRES_WITHIN_SECONDS // 3600,
-            )
-            return
         self._refresh_token = new_token
         if self._hass and self._entry:
-            new_data = {**self._entry.data, CONF_REFRESH_TOKEN: new_token}
-            self._hass.config_entries.async_update_entry(self._entry, data=new_data)
-            _LOGGER.info("Insis refresh_token rotated and persisted (was within 24h of expiry)")
+            self._hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, CONF_REFRESH_TOKEN: new_token}
+            )
+            _LOGGER.debug("Insis refresh_token rotated and saved")
 
-    async def _ensure_token(self) -> str:
-        if self._access_token and time.time() < self._token_expires - 30:
+    async def _ensure_token(self, rejected: str | None = None) -> str:
+        """A valid access token.
+
+        rejected: an access token the API just refused; a new one is fetched
+        unless another caller has replaced it meanwhile.
+        """
+        async with self._refresh_lock:
+            if (
+                self._access_token
+                and self._access_token != rejected
+                and time.time() < self._token_expires - 30
+            ):
+                return self._access_token
+            try:
+                resp, body = await self._post_refresh()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                # The SSO may have rotated the token without us seeing the
+                # answer. Retry at once, while the old token is still accepted.
+                resp, body = await self._post_refresh()
+
+            if resp.status == 401:
+                _LOGGER.error(
+                    "Insis refresh_token rejected (HTTP 401). "
+                    "Refresh token expired or revoked — user must re-auth. Body: %s",
+                    body[:200],
+                )
+                raise ConfigEntryAuthFailed("refresh_token expired or revoked")
+
+            # The new refresh_token comes even with an unusable body: keep it.
+            new_refresh = resp.cookies.get("refreshToken")
+            sent = new_refresh.value if new_refresh is not None else ""
+            rotated = bool(sent) and sent != self._refresh_token
+            if rotated:
+                self._persist_refresh_token(sent)
+
+            try:
+                data = json.loads(body)
+            except ValueError as err:
+                _LOGGER.error(
+                    "Insis refresh returned non-JSON (HTTP %s): %s", resp.status, body[:200]
+                )
+                raise Exception(f"Token refresh non-JSON response: {err}") from err
+
+            if not isinstance(data, dict) or "accessToken" not in data:
+                _LOGGER.error(
+                    "Insis refresh response missing accessToken (HTTP %s): %s",
+                    resp.status,
+                    body[:200],
+                )
+                if resp.status in (401, 403):
+                    raise ConfigEntryAuthFailed("refresh_token expired or revoked")
+                raise Exception(f"Token refresh failed: HTTP {resp.status}")
+
+            self._access_token = data["accessToken"]
+            self._token_expires = self._jwt_exp(self._access_token) or (
+                time.time() + ACCESS_TOKEN_FALLBACK_TTL
+            )
+            _LOGGER.debug(
+                "Insis token refreshed (HTTP %s): refresh_token %s, access token for %d s",
+                resp.status,
+                "rotated" if rotated else ("unchanged" if sent else "not sent"),
+                self._token_expires - time.time(),
+            )
             return self._access_token
+
+    async def _post_refresh(self) -> tuple[aiohttp.ClientResponse, str]:
         session = await self._get_session()
         try:
-            resp = await session.post(
+            async with session.post(
                 f"{SSO_BASE_URL}/api/authorization/refresh",
                 headers={"Content-Type": "application/json"},
                 cookies={"refreshToken": self._refresh_token},
-            )
-        except aiohttp.ClientError as err:
+            ) as resp:
+                return resp, await resp.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("Insis network error during token refresh: %s", err)
             raise
-
-        if resp.status == 401:
-            body = await resp.text()
-            _LOGGER.error(
-                "Insis refresh_token rejected (HTTP 401). "
-                "Refresh token expired or revoked — user must re-auth. Body: %s",
-                body[:200],
-            )
-            raise ConfigEntryAuthFailed("refresh_token expired or revoked")
-
-        try:
-            data = await resp.json()
-        except aiohttp.ContentTypeError as err:
-            body = await resp.text()
-            _LOGGER.error(
-                "Insis refresh returned non-JSON (HTTP %s): %s",
-                resp.status,
-                body[:200],
-            )
-            raise Exception(f"Token refresh non-JSON response: {err}") from err
-
-        if "accessToken" not in data:
-            _LOGGER.error(
-                "Insis refresh response missing accessToken (HTTP %s): %s",
-                resp.status,
-                data,
-            )
-            if resp.status in (401, 403):
-                raise ConfigEntryAuthFailed("refresh_token expired or revoked")
-            raise Exception(f"Token refresh failed: {data}")
-
-        # Persist rotated refresh_token if server set a new one
-        new_refresh = resp.cookies.get("refreshToken")
-        if new_refresh is not None:
-            self._persist_refresh_token(new_refresh.value)
-
-        self._access_token = data["accessToken"]
-        self._token_expires = time.time() + 850
-        return self._access_token
 
     async def _request(self, method: str, path: str, **kwargs) -> dict | list:
         token = await self._ensure_token()
@@ -145,8 +163,7 @@ class InsisApi:
             method, f"{API_BASE_URL}{path}", headers=headers, **kwargs
         )
         if resp.status == 403:
-            self._access_token = None
-            token = await self._ensure_token()
+            token = await self._ensure_token(rejected=token)
             headers["access-token"] = token
             resp = await session.request(
                 method, f"{API_BASE_URL}{path}", headers=headers, **kwargs
